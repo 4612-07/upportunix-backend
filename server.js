@@ -22,7 +22,18 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 // MIDDLEWARE
 // ============================================================================
 
-const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:3000').split(',');
+const defaultOrigins = [
+    'http://localhost:3000',
+    'http://localhost:4000',
+    'https://upportunix-ia.fr',
+    'https://www.upportunix-ia.fr',
+    'https://app.upportunix-ia.fr',
+    'https://studio.upportunix-ia.fr'
+];
+const allowedOrigins = process.env.CORS_ORIGIN
+    ? [...defaultOrigins, ...process.env.CORS_ORIGIN.split(',')]
+    : defaultOrigins;
+
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
@@ -253,7 +264,7 @@ function initDatabase() {
             type TEXT CHECK(type IN ('subject','body','sequence','personalization','icebreaker')),
             prompt TEXT,
             result TEXT,
-            model TEXT DEFAULT 'claude-3-5-sonnet-20241022',
+            model TEXT DEFAULT 'claude-sonnet-4-6',
             tokens_used INTEGER DEFAULT 0,
             campaign_id INTEGER,
             template_id INTEGER,
@@ -707,7 +718,7 @@ Réponds UNIQUEMENT en JSON valide: {"variants": ["...", "...", "..."]}`
                 'anthropic-version': '2023-06-01'
             },
             body: JSON.stringify({
-                model: 'claude-3-5-sonnet-20241022',
+                model: 'claude-sonnet-4-6',
                 max_tokens: 2000,
                 messages: [{ role: 'user', content: prompt }]
             })
@@ -1167,19 +1178,36 @@ app.get('/api/admin/activity', authenticateToken, isAdmin, (req, res) => {
 // PAYMENTS
 // ============================================================================
 
-const PLAN_PRICES = { starter: 0, pro: 4900, agency: 9900, enterprise: 29900 };
+// Plans Upportunix IA — Email AI 29€/mois
+const PLAN_PRICES = {
+    starter: 0,       // essai 14 jours
+    email_ai: 2900,   // 29€/mois — Email AI
+    studio: 0         // sur devis — Studio IA
+};
+
+const PLAN_QUOTAS = {
+    starter: 100,     // 100 emails pendant l'essai
+    email_ai: 1000,   // 1000 emails/mois
+    studio: 99999     // illimité pour Studio
+};
 
 app.post('/api/payments/create-intent', authenticateToken, (req, res) => {
     const { plan } = req.body;
     const amount = PLAN_PRICES[plan];
-    if (amount === undefined || amount === 0) return res.status(400).json({ error: 'Invalid or free plan' });
+    if (amount === undefined || amount === 0) return res.status(400).json({ error: 'Plan invalide ou gratuit' });
 
     const simulatedPaymentId = 'pi_upportunix_' + Date.now();
+    const quota = PLAN_QUOTAS[plan] || 1000;
+
     db.run(`INSERT INTO payments (user_id, amount, plan, status, stripe_payment_id, description)
         VALUES (?, ?, ?, 'pending', ?, ?)`,
-        [req.user.id, amount / 100, plan, simulatedPaymentId, `UPPORTUNIX ${plan}`],
+        [req.user.id, amount / 100, plan, simulatedPaymentId, `UPPORTUNIX IA — ${plan}`],
         function(err) {
-            if (err) return res.status(500).json({ error: 'Failed to create payment' });
+            if (err) return res.status(500).json({ error: 'Échec création paiement' });
+            // Update user plan and quota
+            db.run(`UPDATE users SET plan=?, email_quota=?, plan_start=CURRENT_TIMESTAMP,
+                    plan_end=datetime('now', '+1 month'), updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+                [plan, quota, req.user.id]);
             res.json({ paymentId: this.lastID, clientSecret: 'simulated_' + simulatedPaymentId, amount, plan });
         });
 });
@@ -1199,17 +1227,199 @@ app.get('/api/payments', authenticateToken, (req, res) => {
 });
 
 // ============================================================================
+// STUDIO IA — CONTACT FORM
+// Route publique pour recevoir les demandes de studio.upportunix-ia.fr
+// ============================================================================
+
+// Table studio_contacts (créée au démarrage)
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS studio_contacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        first_name TEXT,
+        last_name TEXT,
+        email TEXT NOT NULL,
+        company TEXT,
+        service TEXT,
+        message TEXT,
+        ip_address TEXT,
+        status TEXT DEFAULT 'new' CHECK(status IN ('new','contacted','qualified','closed')),
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+});
+
+app.post('/api/studio/contact', (req, res) => {
+    const { first_name, last_name, email, company, service, message } = req.body;
+    if (!email || !message) return res.status(400).json({ error: 'Email et message requis' });
+
+    db.run(`INSERT INTO studio_contacts (first_name, last_name, email, company, service, message, ip_address)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [first_name, last_name, email, company, service, message, req.ip],
+        function(err) {
+            if (err) return res.status(500).json({ error: 'Erreur serveur' });
+
+            // Notifier l'admin par email si SMTP configuré
+            const adminEmail = process.env.ADMIN_EMAIL || 'studio@upportunix-ia.fr';
+            const smtpHost = process.env.SMTP_HOST;
+            if (smtpHost) {
+                const transporter = nodemailer.createTransport({
+                    host: smtpHost,
+                    port: parseInt(process.env.SMTP_PORT) || 587,
+                    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+                });
+                transporter.sendMail({
+                    from: `"UPPORTUNIX Studio" <${process.env.SMTP_USER}>`,
+                    to: adminEmail,
+                    subject: `[Studio] Nouvelle demande de ${first_name} ${last_name} — ${company}`,
+                    html: `<h2>Nouvelle demande Studio IA</h2>
+                           <p><strong>Nom :</strong> ${first_name} ${last_name}</p>
+                           <p><strong>Email :</strong> ${email}</p>
+                           <p><strong>Entreprise :</strong> ${company}</p>
+                           <p><strong>Service :</strong> ${service}</p>
+                           <p><strong>Message :</strong><br>${message}</p>`
+                }).catch(e => console.error('Studio email notification failed:', e));
+            }
+
+            res.status(201).json({ message: 'Demande envoyée avec succès', id: this.lastID });
+        }
+    );
+});
+
+// Vue admin des demandes Studio
+app.get('/api/studio/contacts', authenticateToken, isAdmin, (req, res) => {
+    db.all('SELECT * FROM studio_contacts ORDER BY created_at DESC', [], (err, rows) => {
+        res.json(rows || []);
+    });
+});
+
+app.put('/api/studio/contacts/:id', authenticateToken, isAdmin, (req, res) => {
+    const { status } = req.body;
+    db.run('UPDATE studio_contacts SET status=? WHERE id=?', [status, req.params.id], function(err) {
+        if (this.changes === 0) return res.status(404).json({ error: 'Contact not found' });
+        res.json({ message: 'Statut mis à jour' });
+    });
+});
+
+// ============================================================================
+// SCHEDULER — Envoi automatique des séquences email
+// Tourne toutes les 5 minutes, envoie les emails en attente
+// ============================================================================
+
+const SCHEDULER_INTERVAL = parseInt(process.env.SCHEDULER_INTERVAL_MS) || 5 * 60 * 1000; // 5 min
+
+async function runEmailScheduler() {
+    const now = new Date();
+    const hour = now.getHours();
+
+    // Récupère toutes les campagnes actives
+    db.all(`SELECT c.*, s.host, s.port, s.secure, s.username, s.password, s.from_name, s.from_email as smtp_from
+            FROM campaigns c
+            LEFT JOIN smtp_configs s ON s.user_id = c.user_id AND s.is_default = 1
+            WHERE c.status = 'active'`,
+        [], (err, campaigns) => {
+            if (err || !campaigns.length) return;
+
+            campaigns.forEach(campaign => {
+                // Respecter les plages horaires d'envoi
+                const startHour = parseInt((campaign.send_time_start || '08:00').split(':')[0]);
+                const endHour = parseInt((campaign.send_time_end || '18:00').split(':')[0]);
+                if (hour < startHour || hour >= endHour) return;
+
+                // Pas d'envoi le week-end si désactivé
+                const day = now.getDay();
+                if (!campaign.send_on_weekends && (day === 0 || day === 6)) return;
+
+                if (!campaign.host) return; // pas de SMTP configuré
+
+                // Récupère les étapes de la campagne
+                db.all(`SELECT * FROM campaign_steps WHERE campaign_id = ? ORDER BY step_number`,
+                    [campaign.id], (err, steps) => {
+                        if (!steps || !steps.length) return;
+
+                        steps.forEach(step => {
+                            // Contacts actifs de la liste qui n'ont pas encore reçu cet email
+                            db.all(`SELECT c.* FROM contacts c
+                                    WHERE c.list_id = ? AND c.status = 'active'
+                                    AND c.id NOT IN (
+                                        SELECT contact_id FROM email_sends
+                                        WHERE campaign_id = ? AND step_id = ?
+                                    )
+                                    LIMIT ?`,
+                                [campaign.list_id, campaign.id, step.id, campaign.daily_limit || 100],
+                                (err, contacts) => {
+                                    if (!contacts || !contacts.length) return;
+
+                                    const transporter = createTransporter(campaign);
+
+                                    contacts.forEach(contact => {
+                                        // Personnaliser le contenu
+                                        const personalize = (text) => (text || '')
+                                            .replace(/\{\{prenom\}\}/gi, contact.first_name || '')
+                                            .replace(/\{\{nom\}\}/gi, contact.last_name || '')
+                                            .replace(/\{\{entreprise\}\}/gi, contact.company || '')
+                                            .replace(/\{\{poste\}\}/gi, contact.job_title || '');
+
+                                        const trackingId = crypto.randomBytes(16).toString('hex');
+                                        const subject = personalize(step.subject);
+                                        const apiUrl = process.env.API_URL || 'http://localhost:4000';
+                                        const trackPixel = `<img src="${apiUrl}/track/open/${trackingId}" width="1" height="1" style="display:none"/>`;
+                                        const unsubLink = `<p style="font-size:11px;color:#999;margin-top:20px"><a href="${apiUrl}/unsubscribe/${trackingId}">Se désabonner</a></p>`;
+                                        const bodyHtml = personalize(step.body_html) + trackPixel + unsubLink;
+
+                                        // Insérer le send en base
+                                        db.run(`INSERT INTO email_sends (campaign_id, step_id, contact_id, user_id, subject, status, tracking_id, message_id)
+                                                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
+                                            [campaign.id, step.id, contact.id, campaign.user_id, subject, trackingId, trackingId],
+                                            function(err) {
+                                                if (err) return;
+                                                const sendId = this.lastID;
+
+                                                transporter.sendMail({
+                                                    from: `"${campaign.from_name || campaign.smtp_from}" <${campaign.from_email || campaign.smtp_from}>`,
+                                                    to: contact.email,
+                                                    subject,
+                                                    html: bodyHtml,
+                                                    text: personalize(step.body_text || '')
+                                                }).then(() => {
+                                                    db.run(`UPDATE email_sends SET status='sent', sent_at=CURRENT_TIMESTAMP, message_id=? WHERE id=?`,
+                                                        [trackingId, sendId]);
+                                                    db.run(`UPDATE campaigns SET total_sent=total_sent+1 WHERE id=?`, [campaign.id]);
+                                                    db.run(`UPDATE users SET email_sent=email_sent+1 WHERE id=?`, [campaign.user_id]);
+                                                }).catch(e => {
+                                                    db.run(`UPDATE email_sends SET status='failed', error_message=? WHERE id=?`,
+                                                        [e.message, sendId]);
+                                                });
+                                            }
+                                        );
+                                    });
+                                }
+                            );
+                        });
+                    }
+                );
+            });
+        }
+    );
+}
+
+// Démarrer le scheduler
+setInterval(runEmailScheduler, SCHEDULER_INTERVAL);
+console.log(`⏰ Email scheduler démarré — interval: ${SCHEDULER_INTERVAL / 1000}s`);
+
+// ============================================================================
 // HEALTH CHECK
 // ============================================================================
 
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'OK',
-        service: 'UPPORTUNIX API',
-        version: '1.0.0',
+        service: 'UPPORTUNIX IA API',
+        version: '2.0.0',
         timestamp: new Date().toISOString(),
         environment: NODE_ENV,
-        database: 'connected'
+        database: 'connected',
+        ai_model: 'claude-sonnet-4-6',
+        scheduler: 'active',
+        features: ['email-ai', 'studio-contact', 'sequences', 'tracking', 'rgpd']
     });
 });
 
@@ -1230,10 +1440,11 @@ app.listen(PORT, () => {
     console.log(`
 ╔═══════════════════════════════════════════════════════════════════╗
 ║                                                                   ║
-║        📧 UPPORTUNIX API Server Running                          ║
+║        📧 UPPORTUNIX IA API v2.0 — Running                       ║
 ║                                                                   ║
 ║        Port: ${PORT}                                                ║
 ║        Environment: ${NODE_ENV}                                    ║
+║        AI Model: claude-sonnet-4-6                                ║
 ║                                                                   ║
 ║        AUTH          POST  /api/auth/register                     ║
 ║                      POST  /api/auth/login                        ║
@@ -1254,7 +1465,7 @@ app.listen(PORT, () => {
 ║        TEMPLATES     GET   /api/templates                         ║
 ║                      POST  /api/templates                         ║
 ║                                                                   ║
-║        AI            POST  /api/ai/generate                       ║
+║        AI            POST  /api/ai/generate (claude-sonnet-4-6)   ║
 ║                      GET   /api/ai/history                        ║
 ║                                                                   ║
 ║        SMTP          GET   /api/smtp                              ║
@@ -1265,6 +1476,9 @@ app.listen(PORT, () => {
 ║                      GET   /api/analytics/campaigns               ║
 ║                      GET   /api/analytics/contacts                ║
 ║                                                                   ║
+║        STUDIO        POST  /api/studio/contact  (public)          ║
+║                      GET   /api/studio/contacts (admin)           ║
+║                                                                   ║
 ║        ADMIN         GET   /api/admin/users                       ║
 ║                      GET   /api/admin/stats                       ║
 ║                      GET   /api/admin/activity                    ║
@@ -1272,6 +1486,8 @@ app.listen(PORT, () => {
 ║        TRACKING      GET   /track/open/:id                        ║
 ║                      GET   /track/click/:id                       ║
 ║                      GET   /unsubscribe/:id                       ║
+║                                                                   ║
+║        SCHEDULER     ⏰ Actif — envoi séquences toutes les 5min   ║
 ║                                                                   ║
 ╚═══════════════════════════════════════════════════════════════════╝
     `);
